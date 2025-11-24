@@ -1,0 +1,5 @@
+{
+  "name": "Canvas Force Graph",
+  "description": "A high-performance, framework-agnostic force-directed graph visualization using HTML5 Canvas. Features interactive nodes, collision detection, and dynamic graph expansion.",
+  "requestFramePermissions": []
+}
