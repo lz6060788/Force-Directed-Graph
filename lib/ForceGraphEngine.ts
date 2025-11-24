@@ -30,12 +30,17 @@ export class ForceGraphEngine {
   private readonly CENTER_PULL = 0.0005;
   private readonly MAX_VELOCITY = 15;
   
+  // Viewport / Camera State
+  private transform = { x: 0, y: 0, k: 1 };
+  
   // Interaction State
   private draggedNode: EngineNode | null = null;
   private hoveredNode: EngineNode | null = null;
-  private isDragging = false;
-  private lastMousePos = { x: 0, y: 0 };
-  private clickStartPos = { x: 0, y: 0 };
+  private isDraggingNode = false;
+  private isPanning = false;
+  
+  private lastMousePos = { x: 0, y: 0 }; // Screen coords
+  private clickStartPos = { x: 0, y: 0 }; // Screen coords for click detection
   private dpr: number = 1;
 
   constructor(canvas: HTMLCanvasElement, options: EngineOptions) {
@@ -60,7 +65,7 @@ export class ForceGraphEngine {
     this.canvas.height = height * this.dpr;
     this.canvas.style.width = `${width}px`;
     this.canvas.style.height = `${height}px`;
-    this.ctx.scale(this.dpr, this.dpr);
+    // We handle scaling in draw() now to combine it with zoom/pan
   }
 
   public resize(width: number, height: number) {
@@ -109,8 +114,19 @@ export class ForceGraphEngine {
     return `hsl(${hue}, ${sat}%, ${light}%)`;
   }
 
+  // --- Coordinate Systems ---
+  // Screen: Pixels on the DOM element
+  // World: The virtual physics coordinate space
+
+  private screenToWorld(sx: number, sy: number) {
+    return {
+      x: (sx - this.transform.x) / this.transform.k,
+      y: (sy - this.transform.y) / this.transform.k
+    };
+  }
+
   private setupInputHandlers() {
-    const getPos = (e: MouseEvent | TouchEvent) => {
+    const getScreenPos = (e: MouseEvent | TouchEvent) => {
       const rect = this.canvas.getBoundingClientRect();
       const clientX = 'touches' in e ? e.touches[0].clientX : (e as MouseEvent).clientX;
       const clientY = 'touches' in e ? e.touches[0].clientY : (e as MouseEvent).clientY;
@@ -120,73 +136,120 @@ export class ForceGraphEngine {
       };
     };
 
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const pos = getScreenPos(e);
+      const worldBefore = this.screenToWorld(pos.x, pos.y);
+      
+      const zoomIntensity = 0.1;
+      const delta = e.deltaY > 0 ? -zoomIntensity : zoomIntensity;
+      const newK = Math.max(0.1, Math.min(5, this.transform.k * (1 + delta))); // Clamp zoom 0.1x to 5x
+
+      // Adjust translation so the point under mouse remains stationary
+      // screen = world * k + t  =>  t = screen - world * k
+      this.transform.x = pos.x - worldBefore.x * newK;
+      this.transform.y = pos.y - worldBefore.y * newK;
+      this.transform.k = newK;
+    };
+
     const onDown = (e: MouseEvent | TouchEvent) => {
       e.preventDefault();
-      const pos = getPos(e);
-      this.clickStartPos = { ...pos };
+      const screenPos = getScreenPos(e);
+      const worldPos = this.screenToWorld(screenPos.x, screenPos.y);
       
-      const node = this.getNodeAt(pos.x, pos.y);
+      this.clickStartPos = { ...screenPos };
+      this.lastMousePos = { ...screenPos };
+      
+      const node = this.getNodeAt(worldPos.x, worldPos.y);
+      
       if (node) {
         this.draggedNode = node;
-        this.isDragging = true;
-        this.lastMousePos = pos;
+        this.isDraggingNode = true;
         this.canvas.style.cursor = 'grabbing';
+      } else {
+        this.isPanning = true;
+        this.canvas.style.cursor = 'move';
       }
     };
 
     const onMove = (e: MouseEvent | TouchEvent) => {
       e.preventDefault();
-      const pos = getPos(e);
-
-      if (this.isDragging && this.draggedNode) {
-        // Manual position update during drag
-        this.draggedNode.x = pos.x;
-        this.draggedNode.y = pos.y;
+      const screenPos = getScreenPos(e);
+      
+      if (this.isDraggingNode && this.draggedNode) {
+        // Dragging a node (Move it in world space)
+        const worldPos = this.screenToWorld(screenPos.x, screenPos.y);
+        this.draggedNode.x = worldPos.x;
+        this.draggedNode.y = worldPos.y;
         this.draggedNode.vx = 0;
         this.draggedNode.vy = 0;
-      } else {
-        // Hover effect
-        const node = this.getNodeAt(pos.x, pos.y);
+      } 
+      else if (this.isPanning) {
+        // Panning the canvas
+        const dx = screenPos.x - this.lastMousePos.x;
+        const dy = screenPos.y - this.lastMousePos.y;
+        this.transform.x += dx;
+        this.transform.y += dy;
+      } 
+      else {
+        // Just Hovering
+        const worldPos = this.screenToWorld(screenPos.x, screenPos.y);
+        const node = this.getNodeAt(worldPos.x, worldPos.y);
         if (node !== this.hoveredNode) {
           this.hoveredNode = node || null;
           this.canvas.style.cursor = node ? 'grab' : 'default';
         }
       }
+
+      this.lastMousePos = { ...screenPos };
     };
 
     const onUp = (e: MouseEvent | TouchEvent) => {
-      // Logic handled via window listener below
+      // Check for click
+      if (this.isDraggingNode && this.draggedNode) {
+         // It was a node interaction
+         // We check distance from initial click to see if it was a "click" or a "drag"
+         // Logic handled via window listener below is safer for drag release
+      }
+      // State reset handled by window listener
     };
 
     // Binding proper listeners
+    this.canvas.addEventListener('wheel', onWheel, { passive: false });
     this.canvas.addEventListener('mousedown', onDown);
     this.canvas.addEventListener('mousemove', onMove);
+    
+    // Global release to catch drags that go outside canvas
     window.addEventListener('mouseup', (e) => {
-      const pos = getPos(e);
-      const dist = Math.sqrt(Math.pow(pos.x - this.clickStartPos.x, 2) + Math.pow(pos.y - this.clickStartPos.y, 2));
+      const screenPos = getScreenPos(e);
+      // Calculate distance moved in Screen Pixels
+      const dist = Math.sqrt(Math.pow(screenPos.x - this.clickStartPos.x, 2) + Math.pow(screenPos.y - this.clickStartPos.y, 2));
       
-      if (this.draggedNode && dist < 5) {
+      if (this.isDraggingNode && this.draggedNode && dist < 5) {
          this.options.onNodeClick?.(this.draggedNode);
       }
 
-      this.isDragging = false;
+      this.isDraggingNode = false;
       this.draggedNode = null;
+      this.isPanning = false;
       this.canvas.style.cursor = 'default';
     });
 
+    // Touch support
     this.canvas.addEventListener('touchstart', onDown, { passive: false });
     this.canvas.addEventListener('touchmove', onMove, { passive: false });
     this.canvas.addEventListener('touchend', () => {
-       this.isDragging = false;
+       this.isDraggingNode = false;
        this.draggedNode = null;
+       this.isPanning = false;
     });
   }
 
-  private getNodeAt(x: number, y: number): EngineNode | undefined {
+  private getNodeAt(worldX: number, worldY: number): EngineNode | undefined {
     // Iterate in reverse to catch top-most nodes first
     for (const node of Array.from(this.nodes.values()).reverse()) {
-      const dx = x - node.x;
-      const dy = y - node.y;
+      const dx = worldX - node.x;
+      const dy = worldY - node.y;
       if (dx * dx + dy * dy <= node.radius * node.radius) {
         return node;
       }
@@ -196,10 +259,10 @@ export class ForceGraphEngine {
 
   private calculateForces() {
     const nodeList = Array.from(this.nodes.values());
-    const width = this.options.width;
-    const height = this.options.height;
-    const centerX = width / 2;
-    const centerY = height / 2;
+    // Gravity center pulls towards the logical center of the screen space (untransformed)
+    // allowing the graph to center itself naturally, even if we pan away.
+    const centerX = this.options.width / 2;
+    const centerY = this.options.height / 2;
 
     for (let i = 0; i < nodeList.length; i++) {
       const node = nodeList[i];
@@ -208,7 +271,7 @@ export class ForceGraphEngine {
       let fx = 0;
       let fy = 0;
 
-      // 1. Center Gravity (Weak pull to center)
+      // 1. Center Gravity (Weak pull to center of the UNIVERSE)
       fx += (centerX - node.x) * this.CENTER_PULL;
       fy += (centerY - node.y) * this.CENTER_PULL;
 
@@ -330,12 +393,7 @@ export class ForceGraphEngine {
       node.vx *= this.DAMPING;
       node.vy *= this.DAMPING;
 
-      // Wall boundaries (soft bounce)
-      const padding = node.radius;
-      if (node.x < padding) { node.x = padding; node.vx *= -0.5; }
-      if (node.x > this.options.width - padding) { node.x = this.options.width - padding; node.vx *= -0.5; }
-      if (node.y < padding) { node.y = padding; node.vy *= -0.5; }
-      if (node.y > this.options.height - padding) { node.y = this.options.height - padding; node.vy *= -0.5; }
+      // REMOVED Wall boundaries to allow infinite canvas
     });
 
     this.resolveCollisions();
@@ -344,12 +402,25 @@ export class ForceGraphEngine {
   private draw() {
     const { width, height } = this.options;
     
-    // Background
-    this.ctx.fillStyle = '#0f172a'; // Match Tailwind slate-900
+    // 1. Clear Screen (Screen Space)
+    this.ctx.resetTransform();
+    this.ctx.scale(this.dpr, this.dpr); // Restore default DPR scaling for clear
+    this.ctx.fillStyle = '#0f172a'; 
     this.ctx.fillRect(0, 0, width, height);
 
+    // 2. Apply Camera Transform (Pan/Zoom)
+    // Note: We already scaled by DPR. Now we accumulate the camera transform.
+    // The sequence is: Translate (Pan) -> Scale (Zoom)
+    this.ctx.translate(this.transform.x, this.transform.y);
+    this.ctx.scale(this.transform.k, this.transform.k);
+
+    // --- Draw World Content ---
+
     // Links
-    this.ctx.lineWidth = 1.5;
+    this.ctx.lineWidth = 1.5; 
+    // Optimization: Don't let lines get too thin or too thick when zooming?
+    // For now, let them scale naturally.
+    
     this.links.forEach(link => {
       const source = this.nodes.get(link.source);
       const target = this.nodes.get(link.target);
@@ -364,7 +435,7 @@ export class ForceGraphEngine {
 
     // Nodes
     this.nodes.forEach(node => {
-      // Glow/Shadow
+      // Glow/Shadow (Scale independent approx)
       this.ctx.shadowBlur = 15;
       this.ctx.shadowColor = node.color || '#fff';
       
@@ -373,25 +444,31 @@ export class ForceGraphEngine {
       this.ctx.fillStyle = node.color || '#3b82f6';
       this.ctx.fill();
 
-      // Border for contrast
+      // Border
       this.ctx.shadowBlur = 0;
       this.ctx.lineWidth = 2;
-      this.ctx.strokeStyle = '#1e293b'; // slate-800
+      this.ctx.strokeStyle = '#1e293b'; 
       this.ctx.stroke();
 
-      // Label (Weight)
-      this.ctx.fillStyle = 'white';
-      this.ctx.font = '10px sans-serif';
-      this.ctx.textAlign = 'center';
-      this.ctx.textBaseline = 'middle';
-      if (node.radius > 15) {
-         this.ctx.fillText(node.weight.toString(), node.x, node.y);
+      // Label (Weight) - Only draw if large enough on screen
+      // Screen Radius = World Radius * Scale
+      const screenRadius = node.radius * this.transform.k;
+      
+      if (screenRadius > 10) {
+        this.ctx.fillStyle = 'white';
+        // Keep font size consistent-ish in world space, or consistent in screen space?
+        // Let's keep it readable: Scale the font inverse to zoom?
+        // Or just let it scale. Let's let it scale but clamp minimums.
+        this.ctx.font = '10px sans-serif'; 
+        this.ctx.textAlign = 'center';
+        this.ctx.textBaseline = 'middle';
+        this.ctx.fillText(node.weight.toString(), node.x, node.y);
       }
       
       // Highlight hovered
       if (node === this.hoveredNode) {
          this.ctx.strokeStyle = 'white';
-         this.ctx.lineWidth = 2;
+         this.ctx.lineWidth = 2; // This will scale with zoom
          this.ctx.stroke();
       }
     });
